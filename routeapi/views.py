@@ -2,24 +2,56 @@
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 import json
+import os
 import requests
+from dotenv import load_dotenv
 from .utils import load_stations, compute_stops
 
-NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
+# Load environment variables
+load_dotenv()
+
 OSRM_ROUTE = "https://router.project-osrm.org/route/v1/driving/{coords}?overview=full&geometries=geojson"
 
 # simple in-memory cache for stations (loaded once)
 stations_cache = None
 
+
+# -----------------------------------------
+# GEOCODING USING LOCATIONIQ (SAFE + .env)
+# -----------------------------------------
 def geocode_address(address):
-    params = {"q": address, "format": "json", "limit": 1, "countrycodes": "us"}
-    headers = {"User-Agent": "fuel-route-service/1.0 (contact@example.com)"}
-    r = requests.get(NOMINATIM_SEARCH, params=params, headers=headers, timeout=10)
+    API_KEY = os.getenv("LOCATIONIQ_KEY")
+
+    if not API_KEY:
+        raise ValueError("LOCATIONIQ_KEY missing in .env file")
+
+    # LocationIQ endpoint
+    url = "https://us1.locationiq.com/v1/search"
+
+    params = {
+        "key": API_KEY,
+        "q": address,
+        "format": "json",
+        "limit": 1,
+        "addressdetails": 1
+    }
+
+    r = requests.get(url, params=params, timeout=10)
+
+    if r.status_code == 401:
+        raise ValueError("Invalid LocationIQ API key")
+
+    if r.status_code == 403:
+        raise ValueError("LocationIQ blocked request — check key or rate limit")
+
     r.raise_for_status()
     data = r.json()
+
     if not data:
         raise ValueError(f"Address not found: {address}")
+
     return float(data[0]["lat"]), float(data[0]["lon"])
+
 
 @csrf_exempt
 def route_plan(request):
@@ -29,6 +61,7 @@ def route_plan(request):
     Response: JSON with route geometry and fuel plan.
     """
     global stations_cache
+
     if request.method != "POST":
         return JsonResponse({"error": "Use POST with JSON body {start, finish}"}, status=400)
 
@@ -39,6 +72,7 @@ def route_plan(request):
 
     start = body.get("start")
     finish = body.get("finish")
+
     if not start or not finish:
         return JsonResponse({"error": "start and finish required"}, status=400)
 
@@ -49,7 +83,7 @@ def route_plan(request):
         except Exception as e:
             return JsonResponse({"error": f"Failed to load stations CSV: {str(e)}"}, status=500)
 
-    # Geocode start & finish
+    # Geocode addresses
     try:
         s_lat, s_lon = geocode_address(start)
         f_lat, f_lon = geocode_address(finish)
@@ -58,6 +92,7 @@ def route_plan(request):
 
     # Single OSRM route call
     coords_param = f"{s_lon},{s_lat};{f_lon},{f_lat}"
+
     try:
         r = requests.get(OSRM_ROUTE.format(coords=coords_param), timeout=15)
         r.raise_for_status()
@@ -72,7 +107,7 @@ def route_plan(request):
     geometry = route_obj.get("geometry", {})
     coords = geometry.get("coordinates", [])
 
-    # Compute stops and estimate cost
+    # Compute fuel stops
     results = compute_stops(coords, stations_cache)
 
     response = {
@@ -92,12 +127,11 @@ def route_plan(request):
             "estimated_cost_usd": results["estimated_cost"]
         }
     }
+
     return JsonResponse(response, safe=False)
 
+
 def api_index(request):
-    """
-    Browser-friendly information page for /api/
-    """
     html = """
     <!doctype html>
     <html>
@@ -123,13 +157,13 @@ def api_index(request):
 
         <h3>Notes</h3>
         <ul>
-          <li>Uses Nominatim (OpenStreetMap) for geocoding.</li>
-          <li>Uses OSRM (router.project-osrm.org) for routing — single route API call.</li>
-          <li>Assumptions: <strong>500-mile tank</strong>, <strong>10 mpg</strong>, start with full tank.</li>
-          <li>Make sure <code>fuel-prices-for-be-assessment.csv</code> is in the project root (next to <code>manage.py</code>).</li>
+          <li>Uses <strong>LocationIQ</strong> for geocoding.</li>
+          <li>Uses <strong>OSRM</strong> for routing — single route API call.</li>
+          <li>Assumptions: <strong>500-mile tank</strong>, <strong>10 mpg</strong>.</li>
+          <li>Make sure <code>fuel-prices-for-be-assessment.csv</code> is in the project root.</li>
         </ul>
 
-        <p><a class="button" href="/admin/">Admin</a> <span style="margin-left:12px" class="muted">(requires superuser)</span></p>
+        <p><a class="button" href="/admin/">Admin</a> <span class="muted">(requires superuser)</span></p>
       </body>
     </html>
     """
